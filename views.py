@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 
-from models import Cliente, Producto, Venta
+from models import Cliente, Producto, Venta, Devolucion
 from shared.json_manager import GestorJSON
 from shared.herramientas import es_email_valido
 
@@ -43,9 +43,7 @@ class ClienteController(CrudBase):
             self.lista.append(Cliente.desde_diccionario(datos))
 
     def guardar(self):
-        datos = []
-        for cliente in self.lista:
-            datos.append(cliente.a_diccionario())
+        datos = [c.a_diccionario() for c in self.lista]
         self.gestor.guardar(datos)
 
     def validar(self, datos, id_actual=None):
@@ -161,9 +159,7 @@ class ProductoController(CrudBase):
             self.lista.append(Producto.desde_diccionario(datos))
 
     def guardar(self):
-        datos = []
-        for producto in self.lista:
-            datos.append(producto.a_diccionario())
+        datos = [p.a_diccionario() for p in self.lista]
         self.gestor.guardar(datos)
 
     def validar(self, datos, id_actual=None):
@@ -262,11 +258,7 @@ class ProductoController(CrudBase):
         return True, f"Producto {id_producto} eliminado"
 
     def con_stock_bajo(self):
-        bajos = []
-        for producto in self.lista:
-            if producto.stock_bajo():
-                bajos.append(producto)
-        return bajos
+        return [p for p in self.lista if p.stock_bajo()]
 
 
 class VentaController(CrudBase):
@@ -279,9 +271,7 @@ class VentaController(CrudBase):
             self.lista.append(Venta.desde_diccionario(datos))
 
     def guardar(self):
-        datos = []
-        for venta in self.lista:
-            datos.append(venta.a_diccionario())
+        datos = [v.a_diccionario() for v in self.lista]
         self.gestor.guardar(datos)
 
     def validar(self, datos):
@@ -385,16 +375,144 @@ class VentaController(CrudBase):
         texto += f"TOTAL con IVA: ${Producto.con_iva(total):.2f}"
         return texto
 
-    def ventas_por_cliente(self):
-        agrupadas = {}
-        for venta in self.lista:
-            if venta.cliente_id not in agrupadas:
-                agrupadas[venta.cliente_id] = []
-            agrupadas[venta.cliente_id].append(venta)
-        return agrupadas
-
     def total_vendido(self):
-        total = 0
-        for venta in self.lista:
-            total += venta.calcular_total()
-        return round(total, 2)
+        return round(sum(v.calcular_total() for v in self.lista), 2)
+
+
+class DevolucionController(CrudBase):
+    def __init__(self, ventas, productos, clientes, archivo="data/devoluciones.json"):
+        self.ventas = ventas
+        self.productos = productos
+        self.clientes = clientes
+        self.gestor = GestorJSON(archivo)
+        self.lista = []
+        for datos in self.gestor.leer():
+            self.lista.append(Devolucion.desde_diccionario(datos))
+
+    def guardar(self):
+        datos = [dev.a_diccionario() for dev in self.lista]
+        self.gestor.guardar(datos)
+
+    def devoluciones_de_venta(self, venta_id):
+        return [d for d in self.lista if d.venta_id == venta_id]
+
+    def cantidad_devuelta(self, venta_id):
+        return sum(d.cantidad for d in self.devoluciones_de_venta(venta_id))
+
+    def cantidad_disponible(self, venta):
+        return venta.cantidad - self.cantidad_devuelta(venta.id)
+
+    def calcular_reembolso(self, venta, cantidad):
+        return Producto.con_iva(cantidad * venta.precio_unitario)
+
+    def validar(self, datos):
+        try:
+            venta_id = int(datos.get("venta_id", 0))
+            cantidad = int(datos.get("cantidad", 0))
+            motivo = str(datos.get("motivo", "")).strip().lower()
+        except (TypeError, ValueError):
+            return "venta_id y cantidad deben ser números enteros"
+
+        venta = self.ventas.obtener(venta_id)
+        if venta is None:
+            return f"No existe la venta #{venta_id}"
+
+        if not Devolucion.dentro_del_plazo(venta.fecha):
+            return f"Superó el límite de {Devolucion.DIAS_LIMITE} días para devoluciones"
+
+        disponible = self.cantidad_disponible(venta)
+        if cantidad <= 0:
+            return "La cantidad a devolver debe ser mayor a 0"
+        if cantidad > disponible:
+            return f"Solo se pueden devolver {disponible} unidad(es) de esta venta"
+
+        if not Devolucion.es_motivo_valido(motivo):
+            return f"Motivo no válido. Opciones: {', '.join(Devolucion.MOTIVOS)}"
+
+        return None
+
+    def leer(self):
+        return self.lista
+
+    def obtener(self, id_registro):
+        for dev in self.lista:
+            if dev.id == id_registro:
+                return dev
+        return None
+
+    def buscar(self, texto):
+        texto = texto.strip().lower()
+        encontradas = []
+        if texto == "":
+            return encontradas
+
+        for dev in self.lista:
+            if texto in dev.motivo or texto in dev.fecha or texto == str(dev.venta_id):
+                encontradas.append(dev)
+        return encontradas
+
+    def siguiente(self):
+        mayor = 0
+        for dev in self.lista:
+            if dev.id > mayor:
+                mayor = dev.id
+        return mayor + 1
+
+    def crear(self, datos):
+        error = self.validar(datos)
+        if error:
+            return False, error
+
+        venta = self.ventas.obtener(int(datos["venta_id"]))
+        cantidad = int(datos["cantidad"])
+        motivo = str(datos["motivo"]).strip().lower()
+        monto_reembolso = self.calcular_reembolso(venta, cantidad)
+
+        devolucion = Devolucion(
+            self.siguiente(),
+            venta.id,
+            cantidad,
+            motivo,
+            monto_reembolso
+        )
+
+        producto = self.productos.obtener(venta.producto_id)
+        if producto and devolucion.regresa_al_stock():
+            producto.devolver_stock(cantidad)
+            self.productos.guardar()
+            msg_stock = f"Stock restablecido (+{cantidad} en inventario -> Nuevo stock: {producto.stock})"
+        else:
+            msg_stock = "Producto defectuoso: no se restablece en el inventario"
+
+        self.lista.append(devolucion)
+        self.guardar()
+        return True, f"Devolución #{devolucion.id} registrada · Reembolso: ${devolucion.monto:.2f} · {msg_stock}"
+
+    def actualizar(self, id_registro, datos):
+        return False, "Las devoluciones no se pueden modificar por políticas de auditoría"
+
+    def eliminar(self, id_registro):
+        return False, "Las devoluciones registradas no se pueden eliminar"
+
+    def nota_credito(self, id_devolucion):
+        dev = self.obtener(id_devolucion)
+        if dev is None:
+            return None
+
+        venta = self.ventas.obtener(dev.venta_id)
+        cliente = self.clientes.obtener(venta.cliente_id) if (self.clientes and venta) else None
+        producto = self.productos.obtener(venta.producto_id) if venta else None
+
+        texto = f"NOTA DE CRÉDITO #{dev.id}   fecha: {dev.fecha}\n"
+        texto += f"Factura  : #{dev.venta_id}   ({cliente.nombre_completo() if cliente else 'Desconocido'})\n"
+        texto += f"Producto : {producto.nombre if producto else 'Desconocido'}\n"
+        texto += f"Cantidad : {dev.cantidad} x ${venta.precio_unitario:.2f}\n"
+        texto += f"Motivo   : {dev.motivo.capitalize()}\n"
+        texto += "-" * 46 + "\n"
+        texto += f"TOTAL REEMBOLSADO (con IVA): ${dev.monto:.2f}\n"
+        stock_txt = f"Reingresado al stock (Stock actual: {producto.stock})" if (producto and dev.regresa_al_stock()) else "No regresa a stock (defectuoso)"
+        texto += f"Estado Stock : {stock_txt}"
+        return texto
+
+    def total_reembolsado(self):
+        return round(sum(d.monto for d in self.lista), 2)

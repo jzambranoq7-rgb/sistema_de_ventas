@@ -130,3 +130,45 @@ class Venta(ModeloBase):
         return (f"{self.fecha} · cliente {self.cliente_id} · "
                 f"{self.cantidad} x producto {self.producto_id} "
                 f"= ${self.calcular_total():.2f}")
+
+
+
+
+class Devolucion(ModeloBase):
+    DIAS_LIMITE = 30
+    MOTIVOS = ("defectuoso", "equivocado", "arrepentido")
+
+    def __init__(self, id_registro, venta_id, cantidad, motivo, monto, fecha=""):
+        super().__init__(id_registro)
+        self.venta_id = int(venta_id)
+        self.cantidad = int(cantidad)
+        self.motivo = str(motivo).strip().lower()
+        self.monto = round(float(monto), 2)
+        self.fecha = fecha or date.today().isoformat()
+
+    @staticmethod
+    def es_motivo_valido(motivo):
+        return str(motivo).strip().lower() in Devolucion.MOTIVOS
+
+    @staticmethod
+    def dentro_del_plazo(fecha_venta, fecha_hoy=None):
+        hoy = date.fromisoformat(fecha_hoy) if fecha_hoy else date.today()
+        dias = (hoy - date.fromisoformat(fecha_venta)).days
+        return 0 <= dias <= Devolucion.DIAS_LIMITE
+
+    def regresa_al_stock(self):
+        return self.motivo != "defectuoso"
+
+    def a_diccionario(self):
+        datos = super().a_diccionario()
+        datos["venta_id"] = self.venta_id
+        datos["cantidad"] = self.cantidad
+        datos["motivo"] = self.motivo
+        datos["monto"] = self.monto
+        datos["fecha"] = self.fecha
+        return datos
+
+    def etiqueta(self):
+        stock_info = "stock restaurado" if self.regresa_al_stock() else "sin retorno a stock"
+        return (f"{self.fecha} · venta #{self.venta_id} · "
+                f"{self.cantidad} un. · {self.motivo} ({stock_info}) · -${self.monto:.2f}")
